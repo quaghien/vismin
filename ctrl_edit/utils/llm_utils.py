@@ -14,7 +14,8 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
 from commons.constants import (COCO_ONLY_CATEGORIES,
                                MISTRALAI_LANGUAGE_MODEL_NAMES,
                                SYNTH_DIFFUSE_DATA_DIR,
-                               VALID_SPATIAL_DIRECTIONS)
+                               VALID_SPATIAL_DIRECTIONS,
+                               VALID_COUNTS)
 from commons.logger import Logger
 from commons.utils import load_json_data, save_to_json
 
@@ -151,9 +152,10 @@ class BaseLLM(ABC):
 
         logger.info(f"Prompt metadata: {prompt_data['meta_description']}")
         logger.info(f"Prompt IO: {prompt_data['io_structure']}")
-        logger.info(
-            f"Prompt example: {prompt_data['samples'][0] if isinstance(prompt_data['samples'], list) else None}"
-        )
+        if prompt_data['samples'] and isinstance(prompt_data['samples'], list):
+            logger.info(f"Prompt example: {prompt_data['samples'][0]}")
+        else:
+            logger.info("No prompt examples available (empty samples)")
 
         return prompt_data
 
@@ -243,18 +245,32 @@ class BaseLLM(ABC):
             from vllm import SamplingParams
 
             if num_beams is not None:
+                # sampling_params = SamplingParams(
+                #     n=num_return_sequences,
+                #     max_tokens=max_length,
+                #     best_of=num_beams,
+                #     stop=stop,
+                #     temperature=0.0,
+                #     use_beam_search=True,
+                # )
                 sampling_params = SamplingParams(
                     n=num_return_sequences,
                     max_tokens=max_length,
-                    best_of=num_beams,
                     stop=stop,
                     temperature=0.0,
                     use_beam_search=True,
                 )
             else:
+                # sampling_params = SamplingParams(
+                #     n=num_return_sequences,
+                #     best_of=num_return_sequences,
+                #     max_tokens=max_length,
+                #     temperature=temperature,
+                #     top_k=top_k,
+                #     stop=stop,
+                # )
                 sampling_params = SamplingParams(
                     n=num_return_sequences,
-                    best_of=num_return_sequences,
                     max_tokens=max_length,
                     temperature=temperature,
                     top_k=top_k,
@@ -550,18 +566,40 @@ class GroundedLLM(BaseLLM):
 
         return None
 
-    def load_valid_coco_nouns(
-        self,
-    ):
-        _, _, categories_name_id, _ = get_coco_tags("train")
-        self.coco_nouns = list(categories_name_id.keys())
-        print(self.coco_nouns)
+    def load_valid_coco_nouns(self):
+        """
+        Load valid COCO object categories.
+        Optional: Only needed if you want to validate generated objects against COCO categories.
+        """
+        try:
+            _, _, categories_name_id, _ = get_coco_tags("train")
+            self.coco_nouns = list(categories_name_id.keys())
+            logger.info(f"Loaded {len(self.coco_nouns)} COCO object categories")
+        except FileNotFoundError as e:
+            logger.warning(
+                f"COCO annotations not found: {e}. "
+                "Skipping COCO noun validation. "
+                "To enable validation, download COCO annotations from: "
+                "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+            )
+            self.coco_nouns = []
 
     def _prepare_prompt(self, image_caption: str, num_examples_in_task_prompt: int, dataset: str):
         sampled_examples_dict = {}
         category_data = self.prompt_data["samples"][dataset]
+        
+        # Determine valid categories based on dataset type
+        if dataset == "counting":
+            valid_categories = VALID_COUNTS
+        elif dataset == "relation":
+            valid_categories = VALID_SPATIAL_DIRECTIONS
+        else:
+            # For other datasets, use all categories without filtering
+            valid_categories = None
+        
         for category, examples_dict in category_data.items():
-            if category not in VALID_SPATIAL_DIRECTIONS:
+            # Apply category filtering only if valid_categories is defined
+            if valid_categories is not None and category not in valid_categories:
                 continue
             safe_sample_size = min(8, len(examples_dict))
             sampled_items_dict = dict(random.sample(list(examples_dict.items()), safe_sample_size))
@@ -576,7 +614,15 @@ class GroundedLLM(BaseLLM):
             if formatted_example_curr:
                 examples.append(formatted_example_curr)
 
-        selected_examples = random.sample(examples, num_examples_in_task_prompt)
+        # Use min to avoid sampling more examples than available
+        actual_num_examples = min(num_examples_in_task_prompt, len(examples))
+        if actual_num_examples < num_examples_in_task_prompt:
+            logger.warning(
+                f"Requested {num_examples_in_task_prompt} examples but only {len(examples)} available. "
+                f"Using {actual_num_examples} examples instead."
+            )
+        
+        selected_examples = random.sample(examples, actual_num_examples)
         random.shuffle(selected_examples)
         logger.debug(f"Selected examples: {selected_examples}")
         # Create the final prompt instruction with correct numbering
@@ -590,6 +636,173 @@ class GroundedLLM(BaseLLM):
         logger.debug(f"Final prompt: {prompt}")
         if self.language_model_name in MISTRALAI_LANGUAGE_MODEL_NAMES:
             prompt = f"[INST] {prompt} [/INST]"
+        return prompt
+
+
+class GeminiLLM(BaseLLM):
+    """
+    LLM wrapper for Google Gemini API.
+    Supports text-only generation without local model loading.
+    """
+
+    def __init__(self, language_model_name: str, prompt_type: str, device: str):
+        super().__init__(language_model_name, prompt_type, device)
+        self.is_api_model = True
+        self.model = None
+
+    def load_pretrained_model_tokenizer(self):
+        """Initialize Gemini API client"""
+        try:
+            import google.generativeai as genai
+            from commons.constants import GEMINI_API_KEY
+
+            genai.configure(api_key=GEMINI_API_KEY)
+            self.model = genai.GenerativeModel("gemini-2.5-flash-lite")
+            self.tokenizer = None  # Gemini handles tokenization internally
+            logger.info("Gemini API initialized successfully")
+        except ImportError:
+            raise ImportError(
+                "google-generativeai package not found. "
+                "Install it with: pip install google-generativeai"
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini API: {e}")
+            raise
+
+    def generate_output(
+        self,
+        input_text: str = None,
+        prompt: str = None,
+        max_length: int = 128,
+        num_examples_in_task_prompt: int = 6,
+        num_return_sequences: int = 1,
+        **kwargs,
+    ):
+        """Generate single output using Gemini API"""
+        if not isinstance(input_text, str) and prompt is None:
+            raise ValueError("Either input_text or prompt must be provided.")
+
+        if prompt is None:
+            prompt = self._prepare_prompt(input_text, num_examples_in_task_prompt)
+
+        logger.debug(f"Input full prompt: {prompt}")
+
+        try:
+            import google.generativeai as genai
+
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=max_length,
+                    temperature=0.8,
+                ),
+            )
+            generated_output = response.text.strip()
+            logger.debug(f"Input Text: {input_text}, Generated Output: {generated_output}")
+            return [generated_output]
+        except Exception as e:
+            logger.error(f"Error generating with Gemini: {e}")
+            return [""]
+
+    def generate_output_batch(
+        self,
+        input_texts: List[str] = None,
+        all_prompts: List[str] = None,
+        max_length: int = 128,
+        num_examples_in_task_prompt: int = 8,
+        num_return_sequences: int = 1,
+        **kwargs,
+    ):
+        """Generate batch outputs using Gemini API"""
+        if input_texts is None and all_prompts is None:
+            raise ValueError("Either input_texts or all_prompts must be provided.")
+
+        if all_prompts is None:
+            if not all(isinstance(input_text, str) for input_text in input_texts):
+                logger.warning("All input texts must be strings.")
+                return []
+            all_prompts = [
+                self._prepare_prompt(input_text, num_examples_in_task_prompt, **kwargs)
+                for input_text in input_texts
+            ]
+
+        try:
+            import google.generativeai as genai
+            import time
+
+            generated_outputs = []
+            for prompt in all_prompts:
+                try:
+                    response = self.model.generate_content(
+                        prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            max_output_tokens=max_length,
+                            temperature=0.8,
+                        ),
+                    )
+                    generated_outputs.append(response.text.strip())
+                    # Add small delay to avoid rate limiting
+                    time.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"Error generating with Gemini for prompt: {e}")
+                    generated_outputs.append("")
+
+            logger.debug(f"Generated {len(generated_outputs)} outputs")
+            return generated_outputs
+        except Exception as e:
+            logger.error(f"Batch generation error: {e}")
+            return [""] * len(all_prompts)
+
+    @staticmethod
+    def get_prompt_data_fpath(prompt_type):
+        # Reuse same prompt source files as other LLMs
+        return os.path.join("ctrl_edit", "promptsource", f"{prompt_type}.json")
+
+    def _prepare_prompt(self, image_caption: str, num_examples_in_task_prompt: int, selected_category: str = None, **kwargs):
+        """
+        Prepare prompt for Gemini API.
+        
+        Args:
+            image_caption: Input text/caption
+            num_examples_in_task_prompt: Number of examples to include
+            selected_category: Category for filtering samples (e.g., 'object', 'attribute')
+            **kwargs: Additional arguments for compatibility
+        
+        Returns:
+            Formatted prompt string
+        """
+        # If selected_category is provided and samples are organized by category
+        if selected_category and "samples" in self.prompt_data and isinstance(self.prompt_data["samples"], dict):
+            try:
+                samples = self.prompt_data["samples"].get(selected_category, [])
+                if not samples:
+                    samples = list(self.prompt_data["samples"].values())[0]
+                selected_examples = random.sample(samples, min(num_examples_in_task_prompt, len(samples)))
+            except (KeyError, ValueError, IndexError):
+                selected_examples = self.prompt_data["samples"][:num_examples_in_task_prompt]
+            
+            # Get task instruction for category if available
+            task_key = f"task_instruction_{selected_category}"
+            if task_key in self.prompt_data:
+                prompt = self.prompt_data[task_key] + "\n"
+            else:
+                prompt = self.prompt_data.get("task_description", "")
+        else:
+            # Default behavior for non-categorized samples
+            examples = self.prompt_data.get("samples", [])
+            if isinstance(examples, dict):
+                examples = list(examples.values())[0] if examples else []
+            selected_examples = examples[:num_examples_in_task_prompt]
+            prompt = self.prompt_data.get("task_description", "")
+
+        # Format examples
+        for i, example in enumerate(selected_examples, 1):
+            if isinstance(example, dict):
+                prompt += f"\n{i}. Input: {example.get('input', '')} Output: {example.get('output', '')}"
+            else:
+                prompt += f"\n{i}. {example}"
+
+        prompt += f"\n{num_examples_in_task_prompt + 1}. Input: {image_caption} Output:"
         return prompt
 
 
@@ -647,9 +860,21 @@ def process_tifa_data(fpath: str) -> list:
 
 
 def save_tifa_prompt_demo_data(output_filepath: str):
+    # Check if output file already exists
+    if os.path.exists(output_filepath):
+        logger.info(f"TIFA prompt file already exists: {output_filepath}")
+        return
+    
     tifa_filepath = "/home/mila/r/rabiul.awal/synth-diffuse/tifa/tifa_v1.0/tifa_v1.0_question_answers.json"
-    samples = process_tifa_data(tifa_filepath)
-    logger.debug(json.dumps(samples[0], indent=4))
+    
+    # Try to load TIFA data, use empty samples if not available
+    if os.path.exists(tifa_filepath):
+        samples = process_tifa_data(tifa_filepath)
+        logger.debug(json.dumps(samples[0], indent=4))
+    else:
+        logger.warning(f"TIFA source file not found: {tifa_filepath}")
+        logger.warning("Creating prompt file with empty samples. The model will generate questions without examples.")
+        samples = []
 
     prompt_data = {
         "meta_description": "Generate questions and answers from image captions.",

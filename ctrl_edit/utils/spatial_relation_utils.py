@@ -6,7 +6,29 @@ from PIL import Image
 
 from commons.constants import LAMA_CKPT, LAMA_CONFIG, VALID_SPATIAL_DIRECTIONS
 
-from ..lama_inpaint import build_lama_model, inpaint_img_with_builded_lama
+# Lazy import to avoid loading LAMA dependencies unless needed
+LAMA_AVAILABLE = None
+build_lama_model = None
+inpaint_img_with_builded_lama = None
+SDXL_INPAINTER = None
+
+def _lazy_import_lama():
+    """Lazy import LAMA modules to avoid Python 3.11 incompatibility issues unless actually needed"""
+    global LAMA_AVAILABLE, build_lama_model, inpaint_img_with_builded_lama
+    if LAMA_AVAILABLE is not None:
+        return LAMA_AVAILABLE
+    
+    try:
+        from ..lama_inpaint import build_lama_model as _build_lama, inpaint_img_with_builded_lama as _inpaint
+        build_lama_model = _build_lama
+        inpaint_img_with_builded_lama = _inpaint
+        LAMA_AVAILABLE = True
+    except Exception as e:
+        LAMA_AVAILABLE = False
+        print(f"Warning: LAMA inpainting unavailable: {e}")
+    
+    return LAMA_AVAILABLE
+
 from .helpers import get_xyxy_from_xywh, pluralize
 
 
@@ -101,8 +123,22 @@ def dilate_mask(mask, dilate_factor=15):
 
 
 def load_llama_model_for_inpainting(device="cuda"):
+    if not _lazy_import_lama():
+        print(
+            "Warning: LAMA inpainting model not available. Falling back to SDXL-based inpainting."
+        )
+        return None, None
     model = build_lama_model(LAMA_CONFIG, LAMA_CKPT, device=device)
     return model, inpaint_img_with_builded_lama
+
+
+def _get_sdxl_inpainter():
+    global SDXL_INPAINTER
+    if SDXL_INPAINTER is None:
+        from .rmvany_utils import SDXLInpainting
+
+        SDXL_INPAINTER = SDXLInpainting()
+    return SDXL_INPAINTER
 
 
 def remove_object_from_image_using_llama_model(
@@ -118,13 +154,31 @@ def remove_object_from_image_using_llama_model(
 
     if dilate_kernel_size is not None:
         inp_mask = dilate_mask(inp_mask, dilate_kernel_size)
-    inp_img_cleaned = inpaint_img_with_builded_lama(
-        model,
-        inp_image,
-        inp_mask,
+
+    if model is not None and inpaint_img_with_builded_lama is not None:
+        inp_img_cleaned = inpaint_img_with_builded_lama(
+            model,
+            inp_image,
+            inp_mask,
+        )
+        inp_img_cleaned = Image.fromarray(inp_img_cleaned)
+        return inp_img_cleaned
+
+    # Fallback: use SDXL inpainting for deep-learning based removal
+    sdxl_inpainter = _get_sdxl_inpainter()
+    mask_image = Image.fromarray(inp_mask).convert("L")
+    source_image = input_image if isinstance(input_image, Image.Image) else Image.fromarray(inp_image)
+    cleaned_images = sdxl_inpainter.generate_inpainting(
+        prompt="highly realistic background",
+        image=source_image,
+        mask_image=mask_image,
+        negative_prompt="blurry, distorted, extra objects",
+        num_inference_steps=25,
+        guidance_scale=6.5,
+        strength=0.95,
     )
-    inp_img_cleaned = Image.fromarray(inp_img_cleaned)
-    return inp_img_cleaned
+    # generate_inpainting returns a list of PIL images
+    return cleaned_images[0]
 
 
 def swap_phrases_in_spatial_prompt(prompt, bounding_box_data):

@@ -1,25 +1,90 @@
-transformers==4.24.0
+transformers
 diffusers
-huggingface-hub==0.10.1
-kornia==0.5.0
-albumentations==0.5.2
-absl-py==1.4.0
-accelerate @ git+https://github.com/huggingface/accelerate@c7e5e41b8c5c3378921f6f5241326abf8cd7d283
-autoawq @ https://github.com/casper-hansen/AutoAWQ/releases/download/v0.2.4/autoawq-0.2.4+cu118-cp38-cp38-linux_x86_64.whl#sha256=c410bfc882bbdd59e2d6f232cc469d8ad55d718e0513dfc40734690ce9593d5b
-diffusers==0.30.0
-flair==0.12.2
-fastapi==0.98.0
-gradio==4.16.0
-huggingface-hub==0.24.5
-img2dataset==1.41.0
-matplotlib==3.7.1
-numpy==1.24.2
-pandas==1.5.3
-ray==2.9.2
-scikit-learn==1.2.2
-torch==2.1.2+cu118
-transformers @ git+https://github.com/huggingface/transformers@5fabebdb7d4f9ee5a6459f7c0dcde0b1901f6205
-uvicorn==0.22.0
-wandb==0.17.0
-xformers==0.0.23.post1+cu118
+huggingface-hub
+kornia
+albumentations
+absl-py
+accelerate
+# autoawq
+diffusers
+flair
+# fastapi
+gradio
+huggingface-hub
+img2dataset
+matplotlib
+numpy
+pandas
+ray
+scikit-learn
+torch
+torchvision
+transformers
+uvicorn
+wandb
+xformers
+Levenshtein
+spacy
+openai
+datasets
+vllm
+python-dotenv
+google-generativeai
+easydict
+inflect
+hydra-core
 
+# python -m spacy download en_core_web_sm
+
+#transformers==4.31.0
+
+
+# ============================================================================
+# INSTALLATION STEPS (Chạy theo thứ tự sau khi pip install -r requirements.txt)
+# ============================================================================
+
+# Step 1: Install fairseq from conda-forge (tránh build errors với pip)
+# conda install -c conda-forge fairseq -y
+
+# Step 2: Install TIFA dependencies (cần install riêng vì conflict versions)
+# pip install word2number evaluate salesforce-lavis promptcap 'modelscope[multi-modal]' torchaudio
+
+# Step 3: Install TIFA from GitHub (KHÔNG dùng PyPI package 'tifa')
+# git clone https://github.com/Yushi-Hu/tifa.git && cd tifa && pip install -e . --no-deps
+
+# cp -r /home/taquocthai/hienhq/vismin/tifa/tifascore /home/taquocthai/miniconda3/envs/vismin2/lib/python3.10/site-packages/
+
+# Step 4: Reinstall torch/torchvision (vì bị uninstall khi cài TIFA)
+# pip install torch torchvision
+
+# Step 5: Upgrade numpy, pyarrow và datasets để tương thích
+# pip install 'numpy>=1.24.4' pyarrow datasets --upgrade
+
+#python -c 'from tifascore.vqa_models import VQAModel; print("TIFA import thành công")'
+
+# ============================================================================
+# LỖI THƯỜNG GẶP VÀ CÁCH FIX:
+# ============================================================================
+# - ImportError "UnifiedQAModel": Code đã fix, dùng VQAModel thay vì UnifiedQAModel
+# - fairseq build error: Dùng conda install thay vì pip
+# - "libtorch_cuda.so not found": Reinstall torch/torchvision sau khi cài TIFA
+# - numpy._core error: Upgrade numpy lên >= 1.24.4 (sẽ lên 2.2.6)
+# - pyarrow.PyExtensionType error: Upgrade datasets lên 4.5.0
+# - Python 3.11 dataclass errors: Nên dùng Python 3.10 (đã test OK)
+# - modelscope/vllm warning về transformers version: Bỏ qua, vẫn chạy được
+# - transformers 5.0.0 incompatible: Downgrade về 4.34-4.37 và upgrade vLLM
+# - vLLM không support Mistral: Upgrade vLLM lên >= 0.3.0
+
+# ============================================================================
+# CÁCH BỎ QUA STAGE 2.5 (NẾU KHÔNG CẦN AUTO-FILTERING):
+# ============================================================================
+# Stage 2.5 chỉ cần cho COCO/VSR để auto-filter bad generated images
+# Nếu bạn muốn skip:
+# 1. Chạy Stage 1, 2, 3 như bình thường
+# 2. Bỏ qua Stage 2.5 (auto_filter_question_gen.py)
+# 3. Stage 3 sẽ generate TẤT CẢ images (không filter)
+# 4. Manual review/filter sau nếu cần
+# 
+# Ưu điểm: Không cần cài TIFA (tránh dependency hell)
+# Nhược điểm: Có thể có ảnh chất lượng kém trong output
+# ============================================================================

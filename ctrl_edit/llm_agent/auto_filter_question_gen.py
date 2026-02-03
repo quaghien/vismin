@@ -18,12 +18,14 @@ from commons.constants import (LANGUAGE_MODEL_NAMES,
                                SYNTH_DIFFUSE_DATA_DIR, TOTAL_NUM_COCO_CHUNKS,
                                VALID_SPATIAL_DIRECTIONS)
 from commons.logger import Logger
-from tifa.tifascore import UnifiedQAModel, filter_question_and_answers
+from commons.utils import load_json_data, save_to_json, set_random_seed
+from tifascore.vqa_models import VQAModel
+from tifascore.question_filter import filter_question_and_answers
+from tifascore.unifiedqa import UnifiedQAModel
 
 from ..utils.helpers import (copy_current_cache_file_as_backup_json,
-                             group_outputs_for_batch_repeats, load_json_data,
-                             remove_current_cache_backup_file, save_to_json,
-                             set_random_seed)
+                             group_outputs_for_batch_repeats,
+                             remove_current_cache_backup_file)
 from ..utils.llm_utils import BaseLLM, save_tifa_prompt_demo_data
 from ..utils.spatial_relation_utils import \
     extract_spatial_direction_from_caption
@@ -564,6 +566,12 @@ if __name__ == "__main__":
         help="Language model name",
     )
     parser.add_argument("--batch_size", default=4, type=int, help="Batch size")
+    parser.add_argument(
+        "--input_json",
+        type=str,
+        default=None,
+        help="Path to input JSON file from Stage 1. If not provided, will use default hardcoded path.",
+    )
     args = parser.parse_args()
 
     args_dict_formatted = ", ".join([f"`{attr}`: {getattr(args, attr)}" for attr in vars(args)])
@@ -579,16 +587,37 @@ if __name__ == "__main__":
     if dataset == "coco" and split == "train" and chunk_index is None:
         raise ValueError("Please provide a chunk index for the COCO train split.")
 
-    src_prefix = "edit_suggestion" if dataset in ["coco", "vsr"] else "llm_layout"
-    if chunk_index is not None:
-        input_fpath = os.path.join(
-            SYNTH_DIFFUSE_DATA_DIR,
-            "prompt_resources",
-            f"llm_edits_{dataset}",
-            "mistralaimixtral8x7binstructv0.1",
-            f"{src_prefix}_{split}_chunked",
-            f"chunk_{chunk_index}.json",
+    # Determine input file path
+    if args.input_json:
+        # Use custom input JSON path provided by user
+        input_fpath = args.input_json
+        logger.info(f"Using custom input JSON: {input_fpath}")
+    else:
+        # Fall back to hardcoded path (legacy behavior)
+        src_prefix = "edit_suggestion" if dataset in ["coco", "vsr"] else "llm_layout"
+        if chunk_index is not None:
+            input_fpath = os.path.join(
+                SYNTH_DIFFUSE_DATA_DIR,
+                "prompt_resources",
+                f"llm_edits_{dataset}",
+                "mistralaimixtral8x7binstructv0.1",
+                f"{src_prefix}_{split}_chunked",
+                f"chunk_{chunk_index}.json",
+            )
+        else:
+            input_fpath = os.path.join(
+                SYNTH_DIFFUSE_DATA_DIR,
+                "prompt_resources",
+                f"llm_edits_{dataset}",
+                "mistralaimixtral8x7binstructv0.1",
+                f"{src_prefix}_{split}.json",
+            )
+        logger.warning(
+            f"No --input_json provided. Using hardcoded path (may not match your Stage 1 output): {input_fpath}"
         )
+
+    # Determine output file path
+    if chunk_index is not None:
         output_file_path = os.path.join(
             SYNTH_DIFFUSE_DATA_DIR,
             "prompt_resources",
@@ -596,13 +625,6 @@ if __name__ == "__main__":
             f"chunk_{chunk_index}.json",
         )
     else:
-        input_fpath = os.path.join(
-            SYNTH_DIFFUSE_DATA_DIR,
-            "prompt_resources",
-            f"llm_edits_{dataset}",
-            "mistralaimixtral8x7binstructv0.1",
-            f"{src_prefix}_{split}.json",
-        )
         output_file_path = os.path.join(
             SYNTH_DIFFUSE_DATA_DIR,
             "prompt_resources",

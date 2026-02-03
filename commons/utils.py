@@ -10,6 +10,9 @@ import numpy as np
 import pandas as pd
 import torch
 import threading
+from commons.logger import Logger
+
+logger = Logger.get_logger(__name__)
 
 def set_random_seed():
     # Use SLURM_ARRAY_TASK_ID if it's available, otherwise default to 0

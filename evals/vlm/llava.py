@@ -16,7 +16,20 @@ class LlaVaModel:
         else:
             attn_implementation = None
 
-        processor = LlavaNextProcessor.from_pretrained(model_name_or_path)
+        # Handle processor config compatibility across transformers versions
+        try:
+            processor = LlavaNextProcessor.from_pretrained(model_name_or_path)
+        except TypeError as e:
+            if "image_token" in str(e):
+                # Workaround: LlavaNextProcessor changed API in newer transformers
+                # Load components separately to avoid image_token parameter issue
+                from transformers import AutoTokenizer, AutoImageProcessor
+                tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+                image_processor = AutoImageProcessor.from_pretrained(model_name_or_path)
+                processor = LlavaNextProcessor(image_processor=image_processor, tokenizer=tokenizer)
+            else:
+                raise
+        
         model = LlavaNextForConditionalGeneration.from_pretrained(
             model_name_or_path,
             torch_dtype=torch.float16,

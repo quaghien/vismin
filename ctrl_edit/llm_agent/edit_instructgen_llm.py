@@ -455,7 +455,7 @@ class EditInstructgenBootstrap(EditInstructionGenerator):
         dataset,
         save_every_n: int = 10,
         num_examples_in_task_prompt: int = 8,
-        num_return_sequences=5,
+        num_return_sequences=2,
         batch_size: int = 10,
         batch_generate=False,
     ):
@@ -463,9 +463,14 @@ class EditInstructgenBootstrap(EditInstructionGenerator):
         self.generated_annotations_dict = self.load_existing_annotations(self.cache_file_path)
 
         unique_caption_set = self.get_unique_captions()
-        required_num_samples = max(self.max_edit_instructions - len(self.generated_annotations_dict), 0) // (
-            batch_size * num_return_sequences
-        )
+        # Calculate required iterations, round up to ensure we generate enough samples
+        import math
+        samples_needed = max(self.max_edit_instructions - len(self.generated_annotations_dict), 0)
+        samples_per_iteration = batch_size * num_return_sequences
+        required_num_samples = math.ceil(samples_needed / samples_per_iteration)
+        
+        logger.info(f"Generating {samples_needed} samples in {required_num_samples} iterations ({samples_per_iteration} samples/iteration)")
+        
         for i in tqdm(range(required_num_samples), desc="Generating edit instructions"):
             if not self.llm:
                 raise Exception("LLM is not set. Please set LLM before generating captions.")

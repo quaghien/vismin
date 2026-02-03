@@ -6,20 +6,28 @@ import numpy as np
 import PIL
 import torch
 from diffusers import AutoPipelineForInpainting
-from groundingdino.util import box_ops
 from PIL import Image
-from segment_anything import (SamAutomaticMaskGenerator, SamPredictor,
-                              build_sam, sam_model_registry)
 from word2number import w2n
 
-from commons.constants import CHECKPOINT_DIR
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Lazy imports for SAM to avoid loading when not needed
+def _lazy_import_sam():
+    """Lazy import SAM and GroundingDINO dependencies."""
+    from groundingdino.util import box_ops
+    from segment_anything import (SamAutomaticMaskGenerator, SamPredictor,
+                                  build_sam, sam_model_registry)
+    from commons.constants import CHECKPOINT_DIR
+    return box_ops, SamAutomaticMaskGenerator, SamPredictor, build_sam, sam_model_registry, CHECKPOINT_DIR
 
 
 
 class SamHelper:
     def __init__(self, gen_type="automatic"):
+        # Lazy import SAM dependencies
+        (self.box_ops, self.SamAutomaticMaskGenerator, self.SamPredictor,
+         self.build_sam, self.sam_model_registry, CHECKPOINT_DIR) = _lazy_import_sam()
+        
         sam_checkpoint = os.path.join(CHECKPOINT_DIR, "sam_vit_h_4b8939.pth")
 
         if not os.path.exists(sam_checkpoint):
@@ -36,20 +44,18 @@ class SamHelper:
         else:
             self.sam_predictor = self.load_sam_model(sam_checkpoint)
 
-    @staticmethod
-    def load_sam_generator(sam_checkpoint):
+    def load_sam_generator(self, sam_checkpoint):
         model_type = "vit_h"
-        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam = self.sam_model_registry[model_type](checkpoint=sam_checkpoint)
         sam.to(device=device)
-        mask_generator = SamAutomaticMaskGenerator(sam)
+        mask_generator = self.SamAutomaticMaskGenerator(sam)
         print("SAM model loaded from {}".format(sam_checkpoint))
         return mask_generator
 
-    @staticmethod
-    def load_sam_predictor(sam_checkpoint):
-        sam = build_sam(checkpoint=sam_checkpoint)
+    def load_sam_predictor(self, sam_checkpoint):
+        sam = self.build_sam(checkpoint=sam_checkpoint)
         sam.to(device=device)
-        sam_predictor = SamPredictor(sam)
+        sam_predictor = self.SamPredictor(sam)
         print("SAM model loaded from {}".format(sam_checkpoint))
 
         return sam_predictor
@@ -57,7 +63,7 @@ class SamHelper:
     def mask_predictor(self, image, boxes):
         self.sam_predictor.set_image(image)  # set image
         H, W, _ = image.shape  # box: normalized box xywh -> unnormalized xyxy
-        boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes) * torch.Tensor([W, H, W, H])
+        boxes_xyxy = self.box_ops.box_cxcywh_to_xyxy(boxes) * torch.Tensor([W, H, W, H])
         transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_xyxy, image.shape[:2]).to(device)
         masks, _, _ = self.sam_predictor.predict_torch(
             point_coords=None,

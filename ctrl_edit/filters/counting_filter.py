@@ -18,7 +18,7 @@ logger = Logger.get_logger(__name__)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 set_random_seed()
 
-from tifa.tifascore import UnifiedQAModel, filter_question_and_answers
+from tifascore.vqa_models import VQAModel, filter_question_and_answers
 
 
 class CountingImageVerify:

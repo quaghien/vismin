@@ -16,10 +16,10 @@ from commons.constants import (LANGUAGE_MODEL_NAMES,
                                SYNTH_DIFFUSE_DATA_DIR, TOTAL_NUM_COCO_CHUNKS,
                                VALID_CATEGORY_NAMES)
 from commons.logger import Logger
+from commons.utils import save_to_json, set_random_seed
 
 from ..utils.helpers import (copy_current_cache_file_as_backup_json,
-                             remove_current_cache_backup_file, save_to_json,
-                             set_random_seed)
+                             remove_current_cache_backup_file)
 from ..utils.llm_utils import BaseLLM
 
 # Set up logger
@@ -27,6 +27,13 @@ logger = Logger.get_logger(__name__)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 set_random_seed()
+
+# Helper function to get workspace root
+def get_workspace_root():
+    """Get the workspace root directory (parent of ctrl_edit/)"""
+    current_file = os.path.abspath(__file__)
+    # Go up from ctrl_edit/llm_agent/magic_prompt_gen.py to workspace root
+    return os.path.dirname(os.path.dirname(os.path.dirname(current_file)))
 
 
 class PromptEnhancerLLM(BaseLLM):
@@ -36,7 +43,8 @@ class PromptEnhancerLLM(BaseLLM):
 
     @staticmethod
     def get_prompt_data_fpath(prompt_type):
-        root_dir = os.path.dirname(os.path.abspath(__file__))
+        # Get ctrl_edit directory (parent of llm_agent)
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(root_dir, "promptsource", f"{prompt_type}.json")
 
     def _prepare_prompt(
@@ -122,22 +130,25 @@ class PhraseEnhancementProcessor:
             os.makedirs(os.path.dirname(cache_file_path))
         self.cache_file_path = cache_file_path
 
-    def load_cached_llm_filtered_edits_by_chunk_index(self, dataset: str, split: str, chunk_index: int):
+    def load_cached_llm_filtered_edits_by_chunk_index(self, dataset: str, split: str, chunk_index: int, model_name_str: str):
+        workspace_root = get_workspace_root()
         if chunk_index is not None:
             filepath = os.path.join(
+                workspace_root,
                 SYNTH_DIFFUSE_DATA_DIR,
                 "prompt_resources",
                 f"llm_edits_{dataset}",
-                "mistralaimixtral8x7binstructv0.1",
+                model_name_str,
                 f"edit_instruction_filtered_{split}_chunked",
                 f"chunk_{chunk_index}.json",
             )
         else:
             filepath = os.path.join(
+                workspace_root,
                 SYNTH_DIFFUSE_DATA_DIR,
                 "prompt_resources",
                 f"llm_edits_{dataset}",
-                "mistralaimixtral8x7binstructv0.1",
+                model_name_str,
                 f"edit_instruction_filtered_{split}.json",
             )
         try:
@@ -201,22 +212,33 @@ class PhraseEnhancementProcessor:
 
             curr_image_data = annotations[image_id]
             for curr_list_of_dicts in curr_image_data.values():
-                # need those which are not already in the cache and are not rejected
-                curr_llm_filtered_data = llm_filtered_edits.get(str(image_id), {})
-                filtered_image_edit_ids = []
-                for edit_id, edit_info in curr_llm_filtered_data.items():
-                    if edit_info["reject"] == "NO":
-                        filtered_image_edit_ids.append(edit_id)
-                all_images_edit_ids = [info["edit_id"] for info in curr_list_of_dicts]
-                curr_list_of_dicts = [
-                    info
-                    for info in curr_list_of_dicts
-                    if info["edit_id"] in filtered_image_edit_ids
-                    and info["edit_id"] not in self.cached_phrase_data[image_id]
-                ]
-                logger.info(
-                    f"Filtered {len(all_images_edit_ids) - len(curr_list_of_dicts)} edits out of {len(all_images_edit_ids)}"
-                )
+                # If llm_filtered_edits is provided, use it to filter; otherwise process all edits
+                if llm_filtered_edits is not None:
+                    # need those which are not already in the cache and are not rejected
+                    curr_llm_filtered_data = llm_filtered_edits.get(str(image_id), {})
+                    filtered_image_edit_ids = []
+                    for edit_id, edit_info in curr_llm_filtered_data.items():
+                        if edit_info["reject"] == "NO":
+                            filtered_image_edit_ids.append(edit_id)
+                    all_images_edit_ids = [info["edit_id"] for info in curr_list_of_dicts]
+                    curr_list_of_dicts = [
+                        info
+                        for info in curr_list_of_dicts
+                        if info["edit_id"] in filtered_image_edit_ids
+                        and info["edit_id"] not in self.cached_phrase_data[image_id]
+                    ]
+                    logger.info(
+                        f"Filtered {len(all_images_edit_ids) - len(curr_list_of_dicts)} edits out of {len(all_images_edit_ids)}"
+                    )
+                else:
+                    # No filtering - process all edits that aren't already cached
+                    curr_list_of_dicts = [
+                        info
+                        for info in curr_list_of_dicts
+                        if info["edit_id"] not in self.cached_phrase_data[image_id]
+                    ]
+                    logger.info(f"Processing {len(curr_list_of_dicts)} edits (no filtering applied)")
+                    
                 for info in curr_list_of_dicts:
                     edit_id = info["edit_id"]
                     try:
@@ -344,6 +366,14 @@ class PhraseEnhancementProcessor:
             if (tot_processed + 1) % save_every_n == 0:
                 save_to_json(self.cached_phrase_data, self.cache_file_path)
 
+        # Process remaining items in the batch
+        if image_ids_batch:
+            process_batch(image_ids_batch, phrases_batch, prompts_batch)
+
+        # Save at the end
+        save_to_json(self.cached_phrase_data, self.cache_file_path)
+        remove_current_cache_backup_file(self.cache_file_path)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -351,8 +381,8 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="coco",
-        choices=["coco", "relation", "count"],
-        help="Dataset to use. Possible values: coco, flickr30k.",
+        choices=["coco", "vsr", "relation", "counting"],
+        help="Dataset to use. Possible values: coco, vsr, relation, counting.",
     )
     parser.add_argument(
         "--split",
@@ -365,7 +395,13 @@ if __name__ == "__main__":
         "--chunk_index",
         type=int,
         default=None,
-        help=f"Index of the chunk to process. Possible values: 0-{TOTAL_NUM_COCO_CHUNKS-1}.",
+        help=f"Index of the chunk to process. If None, process all samples in one chunk. Possible values: 0-{TOTAL_NUM_COCO_CHUNKS-1}.",
+    )
+    parser.add_argument(
+        "--total_chunks",
+        type=int,
+        default=1,
+        help="Total number of chunks to divide samples into. Only used when chunk_index is specified.",
     )
     parser.add_argument(
         "--prompt_type",
@@ -385,6 +421,18 @@ if __name__ == "__main__":
         type=int,
         default=4,
         help="Batch size for generating edit instructions.",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to process from the input file. If None, process all samples.",
+    )
+    parser.add_argument(
+        "--input_json",
+        type=str,
+        default=None,
+        help="Path to the input JSON file from Stage 1. If not specified, will auto-detect based on dataset/model/chunk_index.",
     )
 
     args = parser.parse_args()
@@ -406,31 +454,78 @@ if __name__ == "__main__":
         device=device,
     )
     llm.load_pretrained_model_tokenizer()
+    
+    # Use actual model name for folder structure
+    language_model_name_str = re.sub(r"[/\-\.]", "", language_model_name).lower()
+    
+    # Model name mapping for cleaner folder names
+    model_name_mapping = {
+        "mistralai/Mixtral-8x7B-Instruct-v0.1": "mixtral8x7binstructv01",
+        "mistralai/Mistral-7B-Instruct-v0.2": "mistral7binstructv02",
+        "teknium/OpenHermes-2.5-Mistral-7B": "openhermes25mistral7b",
+        "gemini-2.5-flash-lite": "gemini25flashlite",
+    }
+    
+    if language_model_name in model_name_mapping:
+        language_model_name_str = model_name_mapping[language_model_name]
+    
     # load prompts that will be enhanced using llm
+    workspace_root = get_workspace_root()
     output_dir = os.path.join(
-        SYNTH_DIFFUSE_DATA_DIR, "prompt_resources", f"llm_edits_{dataset}", "mistralaimixtral8x7binstructv0.1"
+        workspace_root, SYNTH_DIFFUSE_DATA_DIR, "prompt_resources", f"llm_edits_{dataset}", language_model_name_str
     )
 
-    if dataset == "coco" and split == "train" and chunk_index is None:
-        raise ValueError("Please provide a chunk index for the COCO train split.")
-
-    src_prefix = "edit_suggestion" if dataset == "coco" else "llm_layout"
-    if chunk_index is not None:
-        inp_fpath = os.path.join(output_dir, f"{src_prefix}_{split}_chunked", f"chunk_{chunk_index}.json")
-        output_fpath = os.path.join(output_dir, f"{prompt_type}_{split}_chunked", f"chunk_{chunk_index}.json")
-
+    # Use custom input_json if provided, otherwise auto-detect
+    if args.input_json:
+        # If path starts with SYNTH_DIFFUSE_DATA_DIR/, treat it as relative to workspace root
+        if args.input_json.startswith("SYNTH_DIFFUSE_DATA_DIR/"):
+            inp_fpath = os.path.join(workspace_root, args.input_json)
+        else:
+            # Use path as-is (could be absolute or relative)
+            inp_fpath = args.input_json
+        logger.info(f"Using custom input JSON: {inp_fpath}")
+        # Output path in same directory with magic_prompt prefix
+        output_fpath = os.path.join(
+            os.path.dirname(inp_fpath),
+            f"magic_prompt_{os.path.basename(inp_fpath)}"
+        )
     else:
-        inp_fpath = os.path.join(output_dir, f"{src_prefix}_{split}.json")
-        output_fpath = os.path.join(output_dir, f"{prompt_type}_{split}.json")
+        # Auto-detect mode: chunk_index required for COCO train
+        if dataset == "coco" and split == "train" and chunk_index is None:
+            raise ValueError("Please provide a chunk index for the COCO train split.")
+        
+        src_prefix = "edit_suggestion" if dataset == "coco" else "llm_layout"
+        if chunk_index is not None:
+            inp_fpath = os.path.join(output_dir, f"{src_prefix}_{split}_chunked", f"chunk_{chunk_index}.json")
+            output_fpath = os.path.join(output_dir, f"{prompt_type}_{split}_chunked", f"chunk_{chunk_index}.json")
+        else:
+            inp_fpath = os.path.join(output_dir, f"{src_prefix}_{split}.json")
+            output_fpath = os.path.join(output_dir, f"{prompt_type}_{split}.json")
+        logger.info(f"Auto-detected input JSON: {inp_fpath}")
 
     with open(inp_fpath, "r") as f:
         annotations = json.load(f)
+    
+    # Limit samples if max_samples is specified
+    max_samples = args.max_samples
+    if max_samples is not None and max_samples > 0:
+        logger.info(f"Limiting to {max_samples} samples (out of {len(annotations)} total)")
+        annotations = dict(list(annotations.items())[:max_samples])
+    else:
+        logger.info(f"Processing all {len(annotations)} samples")
 
     enhance_proc = PhraseEnhancementProcessor(llm)
     enhance_proc.set_cache_file_path(output_fpath)
 
     if dataset == "coco":
-        llm_filtered_edits = enhance_proc.load_cached_llm_filtered_edits_by_chunk_index(dataset, split, chunk_index)
+        # Try to load filtered edits if available, otherwise use None (no filtering)
+        try:
+            llm_filtered_edits = enhance_proc.load_cached_llm_filtered_edits_by_chunk_index(dataset, split, chunk_index, language_model_name_str)
+            logger.info("Loaded filtered edits - will apply filtering during processing")
+        except FileNotFoundError as e:
+            logger.warning(f"Filtered edits not found: {e}")
+            logger.info("Will process ALL edits without filtering")
+            llm_filtered_edits = None
         enhance_proc.process_image_edit_data(annotations, llm_filtered_edits, batch_size)
     elif dataset in ["relation", "counting"]:
         enhance_proc.process_image_layout_data(annotations, batch_size)

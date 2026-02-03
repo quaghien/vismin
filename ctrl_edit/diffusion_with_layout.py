@@ -116,6 +116,27 @@ class LlmGroDiffusionProcessor:
         self.cache_fpath = cache_fpath
         self.generated_edit_instructions = self.load_cached_edit_instructions()
         self.file_locker = FileLocker()
+        self._vqa_on_gpu = False  # Track if VQA model is on GPU
+
+    def _ensure_vqa_on_gpu(self):
+        """Load VQA model to GPU only when needed for verification"""
+        if self.vqa_scorer is None:
+            return  # Skip if VQA model not loaded (relation/counting datasets)
+        if not self._vqa_on_gpu:
+            logger.info("Loading VQA model to GPU for verification...")
+            # vqa_scorer.model is ModelFactory, vqa_scorer.model.model is LlaVaModel
+            self.vqa_scorer.model.model.model.to(self.device)
+            self._vqa_on_gpu = True
+    
+    def _offload_vqa_to_cpu(self):
+        """Offload VQA model to CPU to free VRAM"""
+        if self.vqa_scorer is None:
+            return  # Skip if VQA model not loaded (relation/counting datasets)
+        if self._vqa_on_gpu:
+            logger.info("Offloading VQA model to CPU to free VRAM...")
+            self.vqa_scorer.model.model.model.to('cpu')
+            torch.cuda.empty_cache()
+            self._vqa_on_gpu = False
 
     def load_cached_edit_instructions(self):
         logger.info(f"Loading LLM responses from cache {self.cache_fpath}")
@@ -231,7 +252,11 @@ class LlmGroDiffusionProcessor:
             # Offload model saves GPU memory.
             sdxl.init(offload_model=True)
 
-        llama_model, inpaint_img_with_builded_lama = load_llama_model_for_inpainting()
+        # Only load LAMA model for spatial relation dataset
+        llama_model, inpaint_img_with_builded_lama = None, None
+        if args.dataset == "relation":
+            llama_model, inpaint_img_with_builded_lama = load_llama_model_for_inpainting()
+        
         if args.sdxl_retouch_by_mask:
             sdxl_retouch = SDXLInpainting()
             sdxl_retouch.load_model()
@@ -249,14 +274,19 @@ class LlmGroDiffusionProcessor:
         ]
         logger.info(f"Number of images already cached {len(image_ids) - len(image_ids_after_caching)}")
 
-        # load qa annotations
-        qa_fpath = os.path.join(
-            SYNTH_DIFFUSE_DATA_DIR, "prompt_resources", f"qa_annotations_{args.dataset}_{args.split}.json"
-        )
-        if not os.path.exists(qa_fpath):
-            raise FileNotFoundError(f"Could not find qa annotations at {qa_fpath}")
-        with open(qa_fpath, "r") as f:
-            qa_annotations = json.load(f)
+        # load qa annotations (only for COCO/VSR datasets, not needed for relation/counting)
+        qa_annotations = {}
+        if args.dataset not in ["relation", "counting"]:
+            qa_fpath = os.path.join(
+                SYNTH_DIFFUSE_DATA_DIR, "prompt_resources", f"qa_annotations_{args.dataset}_{args.split}.json"
+            )
+            if not os.path.exists(qa_fpath):
+                raise FileNotFoundError(f"Could not find qa annotations at {qa_fpath}")
+            with open(qa_fpath, "r") as f:
+                qa_annotations = json.load(f)
+            logger.info(f"Loaded {len(qa_annotations)} QA annotations for {args.dataset}")
+        else:
+            logger.info(f"Skipping QA annotations for {args.dataset} dataset (not required)")
         # extended_phrase_fpath = os.path.join(
         #     SYNTH_DIFFUSE_DATA_DIR,
         #     "prompt_resources",
@@ -269,9 +299,14 @@ class LlmGroDiffusionProcessor:
         # with open(extended_phrase_fpath, "r") as f:
         #     extended_phrase_annotations = json.load(f)
 
-        image_ids_with_qa_ann = [image_id for image_id in image_ids_after_caching if image_id in qa_annotations]
+        # For relation/counting: use all image_ids; for COCO/VSR: filter by qa_annotations
+        if args.dataset in ["relation", "counting"]:
+            image_ids_with_qa_ann = image_ids_after_caching
+        else:
+            image_ids_with_qa_ann = [image_id for image_id in image_ids_after_caching if image_id in qa_annotations]
+            logger.info(f"Missing qa annotations for {len(image_ids_after_caching) - len(image_ids_with_qa_ann)} images")
+        
         random.shuffle(image_ids_with_qa_ann)
-        logger.info(f"Missing qa annotations for {len(image_ids_after_caching) - len(image_ids_with_qa_ann)} images")
         logger.info(f"Total number of images remaining to be processed: {len(image_ids_with_qa_ann)}")
 
         tot_processed, success_count = 0, 0
@@ -446,7 +481,7 @@ class LlmGroDiffusionProcessor:
                         )
 
                         # specific filtering for relation category
-                        if category == "relation":
+                        if category == "relation" and image_id in qa_annotations:
                             bounding_box_data = llm_response["bounding_boxes"]
                             # choices = [bbox[0] for bbox in llm_response["bounding_boxes"]] + ["none"]
                             generated_questions_chunk = qa_annotations[image_id]["generated_questions"]
@@ -463,6 +498,8 @@ class LlmGroDiffusionProcessor:
                                 )
                                 # question_answer_pairs = get_obj_existence_verify_qa_pairs_by_name(object_name, choices)
                                 question_answer_pairs = generated_questions_chunk[i]
+                                # Load VQA model to GPU before verification
+                                self._ensure_vqa_on_gpu()
                                 tifa_result_dict = vqa_scorer.get_tifa_score(
                                     question_answer_pairs, object_roi_image, enable_logging=False
                                 )
@@ -505,10 +542,14 @@ class LlmGroDiffusionProcessor:
                                 object_name, bounding_box = bounding_box_data[i]
                                 # get all the bounding boxes except the current one
                                 object_roi_image = generated_image.crop(get_xyxy_from_xywh(bounding_box))
-                                # save the image for debugging
-                                object_roi_image.save(f"diffused_generator/output/cropped_images/{object_name}.png")
+                                # save the image for debugging (create folder if not exists)
+                                debug_dir = "diffused_generator/output/cropped_images"
+                                os.makedirs(debug_dir, exist_ok=True)
+                                object_roi_image.save(f"{debug_dir}/{object_name}.png")
                                 choices = [object_name, "something else"]
                                 question_answer_pairs = get_obj_existence_verify_qa_pairs_by_name(object_name, choices)
+                                # Load VQA model to GPU before verification
+                                self._ensure_vqa_on_gpu()
                                 tifa_result_dict = vqa_scorer.get_tifa_score(
                                     question_answer_pairs, object_roi_image, enable_logging=False
                                 )
@@ -537,15 +578,18 @@ class LlmGroDiffusionProcessor:
                     logger.info("***No images generated, skipping***")
                     continue
 
-                if not isinstance(tifa_result_dict_final["tifa_score"], (float, int)):
-                    logger.info(f"***tifa_score is not a float or an int: {tifa_result_dict_final['tifa_score']}***")
-                    continue
-
-                logger.info(f"tifa results: {tifa_result_dict_final['tifa_score']}")
+                # Skip tifa score check if no filtering was applied (e.g., relation dataset without QA)
+                if tifa_result_dict_final is not None:
+                    if not isinstance(tifa_result_dict_final["tifa_score"], (float, int)):
+                        logger.info(f"***tifa_score is not a float or an int: {tifa_result_dict_final['tifa_score']}***")
+                        continue
+                    logger.info(f"tifa results: {tifa_result_dict_final['tifa_score']}")
+                else:
+                    logger.info("No VQA filtering applied, accepting generated image")
                 if not is_notebook:
                     plt.clf()
 
-                if args.sdxl and tifa_result_dict_final["tifa_score"] == 1:
+                if args.sdxl and tifa_result_dict_final is not None and tifa_result_dict_final["tifa_score"] == 1:
                     generated_image.save("diffused_generator/output/sdxl_refine/orig.png")
                     generated_image = sdxl.refine(
                         image=generated_image,
@@ -557,7 +601,7 @@ class LlmGroDiffusionProcessor:
                 edited_image_path = self.get_image_save_path(output_dir)
                 saved_paths.append(edited_image_path)
                 self.save_image(generated_image, edited_image_path)
-                scores_dict[edited_image_path] = tifa_result_dict_final
+                scores_dict[edited_image_path] = tifa_result_dict_final if tifa_result_dict_final is not None else {"tifa_score": None}
 
                 annotations_dict = {
                     "annotations": {
@@ -571,7 +615,7 @@ class LlmGroDiffusionProcessor:
                 logger.info(f"Saved generated images at:\n{formatted_saved_paths}")
                 self.save_generated_image_annotations(annotations_dict, annotation_file_path)
 
-                success_count += tifa_result_dict_final.get("tifa_score", 0) == 1
+                success_count += (tifa_result_dict_final.get("tifa_score", 0) == 1) if tifa_result_dict_final is not None else 1
                 tot_processed += 1
                 end_time = time.time()
                 total_time_taken = end_time - start_time
@@ -647,8 +691,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt_type",
         type=str,
-        default="llm_layout",
-        help=f"Type of prompt to use. Possible values: instruct_pix2pix. Each choice represents a different strategy for generating prompts.",
+        default="edit_instructgen_with_layout",
+        help=f"Type of prompt to use. Default: edit_instructgen_with_layout (for relation/counting). Available prompt files in promptsource/: edit_instructgen_with_layout.json, edit_instructgen_from_caption.json, magic_prompt.json, auto_filter_edit_instruct.json",
     )
     parser.add_argument(
         "--run-model",
@@ -669,6 +713,18 @@ if __name__ == "__main__":
         default="mistralai/Mixtral-8x7B-Instruct-v0.1",
         choices=LANGUAGE_MODEL_NAMES,
         help=f"Set pre-trained language model to use. Possible values: {', '.join(LANGUAGE_MODEL_NAMES)}.",
+    )
+    parser.add_argument(
+        "--edit_instructions_json",
+        type=str,
+        default=None,
+        help="Path to edit instructions JSON file from Stage 1 (e.g., edit_instructgen_with_layout_train_*.json). If not provided, will auto-discover based on dataset and language_model_name.",
+    )
+    parser.add_argument(
+        "--magic_prompt_json",
+        type=str,
+        default=None,
+        help="Path to magic prompt JSON file from Stage 2 (e.g., magic_prompt_edit_instructgen_with_layout_train_*.json). Note: This is NOT used for relation/counting datasets.",
     )
     parser.add_argument(
         "--use-upscale",
@@ -724,19 +780,61 @@ if __name__ == "__main__":
     upscale = args.use_upscale
     language_model_name = args.language_model_name
     language_model_name_str = re.sub(r"[/\-]", "", language_model_name).lower()
-    cache_fpath = os.path.join(
-        SYNTH_DIFFUSE_DATA_DIR,
-        "prompt_resources",
-        f"llm_edits_{dataset_name}",
-        language_model_name_str,
-        f"{prompt_type}_{split}.json",
-    )
-    model_name_or_path = (
-        "llava-hf/llava-v1.6-mistral-7b-hf"  # or liuhaotian/llava-v1.6-34b or liuhaotian/llava-v1.5-13b
-    )
-    load_in_Nbit = 8
+    
+    # Allow user to specify custom JSON path or auto-discover
+    if args.edit_instructions_json:
+        cache_fpath = args.edit_instructions_json
+        logger.info(f"Using custom edit instructions JSON: {cache_fpath}")
+    else:
+        cache_fpath = os.path.join(
+            SYNTH_DIFFUSE_DATA_DIR,
+            "prompt_resources",
+            f"llm_edits_{dataset_name}",
+            language_model_name_str,
+            f"{prompt_type}_{split}.json",
+        )
+        logger.info(f"Auto-discovering edit instructions JSON: {cache_fpath}")
+    
+    # Validate that the file exists
+    if not os.path.exists(cache_fpath):
+        # Try to find the most recent file matching the pattern
+        search_dir = os.path.dirname(cache_fpath)
+        if os.path.exists(search_dir):
+            base_name = os.path.basename(cache_fpath).replace('.json', '')
+            matching_files = [f for f in os.listdir(search_dir) if f.startswith(base_name) and f.endswith('.json')]
+            if matching_files:
+                # Sort by modification time and get the most recent
+                matching_files.sort(key=lambda x: os.path.getmtime(os.path.join(search_dir, x)), reverse=True)
+                cache_fpath = os.path.join(search_dir, matching_files[0])
+                logger.info(f"Found matching file: {cache_fpath}")
+            else:
+                logger.error(f"No matching files found in {search_dir} for pattern {base_name}*.json")
+                raise FileNotFoundError(f"Could not find edit instructions at {cache_fpath}")
+        else:
+            logger.error(f"Directory does not exist: {search_dir}")
+            raise FileNotFoundError(f"Could not find edit instructions at {cache_fpath}")
+    
     llm = GroundedLLM(language_model_name=language_model_name, prompt_type=prompt_type, device=device)
-    vqa_scorer = VQAModelForTifa(model_name_or_path, load_in_Nbit=load_in_Nbit)
+    
+    # Only load VQA model for datasets that require VQA filtering
+    # relation dataset uses spatial relation verification with LAMA inpainting (no VQA needed)
+    # counting/COCO/VSR datasets need VQA for object existence verification
+    vqa_scorer = None
+    if args.dataset != "relation":
+        model_name_or_path = "llava-hf/llava-v1.6-mistral-7b-hf"
+        # Use float16 instead of 8-bit quantization for 7B model (no need for quantization)
+        load_in_Nbit = None  # Set to None to use float16 (full precision)
+        vqa_scorer = VQAModelForTifa(model_name_or_path, load_in_Nbit=load_in_Nbit)
+        
+        # Offload VQA model to CPU to free VRAM for diffusion models
+        logger.info("Offloading VQA model to CPU to free VRAM for diffusion generation...")
+        # vqa_scorer.model is ModelFactory, vqa_scorer.model.model is LlaVaModel
+        vqa_scorer.model.model.model.to('cpu')
+        torch.cuda.empty_cache()
+    else:
+        logger.info(f"Skipping VQA model loading for relation dataset (uses spatial verification with LAMA inpainting)")
+        torch.cuda.empty_cache()
+    
     image_edit_proc = LlmGroDiffusionProcessor(
         llm=llm,
         vqa_scorer=vqa_scorer,

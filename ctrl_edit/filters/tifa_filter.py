@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw
 from torchvision.ops import box_convert
 from tqdm import tqdm
 
-from tifa.tifascore import UnifiedQAModel
+from tifascore.vqa_models import VQAModel
 
 from ..utils.constants import (SYNTH_DIFFUSE_DATA_DIR, TOTAL_NUM_COCO_CHUNKS,
                                VIM_DATA_DIR)

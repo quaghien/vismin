@@ -267,11 +267,11 @@ def remove_current_cache_backup_file(cache_file_path):
 
 def get_coco_path_by_image_id(split: str, image_id: Union[str, int]):
     image_id_str = f"{int(image_id):012d}"
-    return os.path.join(MAIR_LAB_DATA_DIR, "coco", "images", f"{split}2017", f"{image_id_str}.jpg")
+    return os.path.join(COCO_DATA_DIR, f"{split}2017", f"{image_id_str}.jpg")
 
 
 def get_unique_coco_annotations(split: str):
-    fpath = os.path.join(MAIR_LAB_DATA_DIR, "coco", "annotations", f"captions_{split}2017.json")
+    fpath = os.path.join(COCO_DATA_DIR, "annotations", f"captions_{split}2017.json")
     logger.info(f"Loading COCO captions from {fpath}")
     with open(fpath, "r", encoding="utf-8") as f:
         json_data = json.loads(f.read())
