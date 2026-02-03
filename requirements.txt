@@ -1,38 +1,38 @@
-transformers
-diffusers
-huggingface-hub
+# conda create -n vismin python=3.11
 kornia
 albumentations
 absl-py
 accelerate
 # autoawq
-diffusers
 flair
 # fastapi
 gradio
 huggingface-hub
 img2dataset
 matplotlib
-numpy
 pandas
 ray
 scikit-learn
-torch
-torchvision
-transformers
 uvicorn
 wandb
 xformers
 Levenshtein
 spacy
 openai
-datasets
 vllm
 python-dotenv
 google-generativeai
 easydict
 inflect
 hydra-core
+torch
+torchvision
+diffusers
+transformers==4.31.0
+numpy
+pyarrow
+datasets
+
 
 # python -m spacy download en_core_web_sm
 
